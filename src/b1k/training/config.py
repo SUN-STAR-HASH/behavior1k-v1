@@ -916,11 +916,11 @@ _CONFIGS = [
             action_horizon=30,
             action_dim=32,
 
-            # ---- baseline 유지 ----
-            # 여기서는 사용자가 의도한 "Pi0.5 backbone + task embedding + flow matching"에
-            # 최대한 가깝게 두기 위해 1등팀의 추가 기법을 꺼둔다.
-            use_correlated_noise=False,
-            correlation_beta=0.0,
+            # ---- v1 week-scale setting ----
+            # 여기서는 A100 1장으로도 빠르게 검증할 수 있도록
+            # baseline 구조 위에 correlated noise만 반영한다.
+            use_correlated_noise=True,
+            correlation_beta=0.5,
             use_fast_auxiliary=False,
             fast_loss_weight=0.0,
             use_kv_transform=False,

@@ -172,6 +172,7 @@ uv run scripts/train.py pi_behavior_b1k_a100_week --overwrite
 ```
 
 이 설정은 긴 `v1` 실험보다 빠르게 확인하고 싶을 때 유용합니다.
+이 레포에서는 이 A100 week 설정도 `v1` 방향에 맞춰 correlated noise를 켠 상태로 둡니다.
 
 ### W&B 사용
 
