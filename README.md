@@ -1,23 +1,26 @@
-# BEHAVIOR-1K Lightweight Baseline
+# BEHAVIOR-1K v1 Correlated-Noise Baseline
 
 이 저장소는 2025 BEHAVIOR Challenge 1등팀 코드
 [`IliaLarchenko/behavior-1k-solution`](https://github.com/IliaLarchenko/behavior-1k-solution)을
 기본 백본으로 참고하되, 모든 기법을 그대로 가져오지 않고 **꼭 필요한 기술만 단계적으로 검증하기 위한 경량 베이스라인**입니다.
 
-현재 목표는 1등팀 모델에서 다음 세 가지 축만 남긴 비교 기준을 만드는 것입니다.
+현재 목표는 `behavior1k` 경량 베이스라인에 correlated noise를 추가했을 때 성능이 얼마나 바뀌는지 확인하는 것입니다.
+따라서 v1은 1등팀 모델에서 다음 네 가지 축만 남긴 비교 기준입니다.
 
 - **Task embedding**: 자연어 prompt 대신 task id embedding으로 task를 구분합니다.
 - **System 2 stage tracking**: 긴 task를 하나의 숫자로만 표현하지 않고, 현재 진행 stage를 함께 넣습니다.
 - **Flow matching**: action chunk를 생성하는 기본 학습/추론 방식은 Pi0 계열의 flow matching을 유지합니다.
+- **Correlated noise**: action chunk 안의 시간적/차원별 상관관계를 noise sampling에 반영합니다.
 
-이 베이스라인을 먼저 학습하고 평가한 뒤, correlated noise, FAST auxiliary, KV transform,
-knowledge insulation 같은 1등팀의 추가 기술을 하나씩 켜 보며 성능 향상 폭을 비교합니다.
+`behavior1k`는 task embedding + stage tracking + flow matching 기준선이고,
+`behavior1k-v1`은 여기에 correlated noise를 하나 더 켠 실험 버전입니다.
+이후 FAST auxiliary, KV transform, knowledge insulation 같은 1등팀의 추가 기술을 하나씩 켜 보며 성능 향상 폭을 비교합니다.
 최종 목적은 성능에 꼭 필요한 기술만 남기고, 불필요한 구성은 제거해서 더 가벼운 모델을 만드는 것입니다.
 
 ## 개요
 
-현재 A100 재학습 기본 추천 config는 `pi_behavior_b1k_a100_baseline_stage_draft`입니다.
-이 config는 기존 70k task embedding baseline과 같은 step / batch 조건에서 System 2 stage tracking만 추가합니다.
+현재 A100 재학습 기본 추천 config는 `pi_behavior_b1k_a100_baseline_stage_corr_draft`입니다.
+이 config는 `behavior1k`의 70k stage baseline과 같은 step / batch 조건에서 correlated noise만 추가합니다.
 
 주요 특징은 다음과 같습니다.
 
@@ -27,6 +30,7 @@ knowledge insulation 같은 1등팀의 추가 기술을 하나씩 켜 보며 성
 - 3-view RGB 이미지와 robot proprioception 사용
 - Pi0.5 backbone + task embedding + flow matching 유지
 - System 2 stage prediction / stage-conditioned token 지원
+- correlated noise 지원
 - A100 단일 GPU에서 검증된 70k baseline 조건을 기준으로 비교
 - BEHAVIOR task id별 checkpoint switching 지원
 
@@ -42,7 +46,7 @@ knowledge insulation 같은 1등팀의 추가 기술을 하나씩 켜 보며 성
 | Stage 정보 | System 2 방식의 stage 정보 활용 | stage-conditioned token과 stage prediction head만 우선 사용 |
 | Action 학습 | flow matching 기반 | flow matching 유지 |
 | FAST auxiliary | 사용 가능 | 현재 baseline에서는 OFF |
-| Correlated noise | 사용 가능 | 현재 baseline에서는 OFF |
+| Correlated noise | 사용 가능 | v1에서 ON |
 | KV transform | 사용 가능 | 현재 baseline에서는 OFF |
 | Knowledge insulation | 사용 가능 | 현재 baseline에서는 OFF |
 | Fine-tuning 전략 | task group별 추가 fine-tuning 포함 | 70k 단일 비교 학습 기준 |
@@ -51,15 +55,19 @@ knowledge insulation 같은 1등팀의 추가 기술을 하나씩 켜 보며 성
 현재 포함하는 핵심 config:
 
 ```text
-pi_behavior_b1k_a100_baseline_stage_draft
+pi_behavior_b1k_a100_baseline_stage_corr_draft
 ```
 
-이 config는 `task embedding + System 2 stage tracking + flow matching`만 켠 70k 재학습 설정입니다.
-기존 순수 task embedding baseline인 `pi_behavior_b1k_a100_baseline_draft`와 같은 조건에서 비교할 수 있게 만들었습니다.
+이 config는 `task embedding + System 2 stage tracking + flow matching + correlated noise`를 켠 70k 재학습 설정입니다.
+`behavior1k`의 `pi_behavior_b1k_a100_baseline_stage_draft`와 같은 조건에서 correlated noise만 더한 비교 실험입니다.
+
+v1에서 추가로 켠 기술:
+
+- `use_correlated_noise=True`
+- `correlation_beta=0.5`
 
 현재 의도적으로 꺼 둔 기술:
 
-- `use_correlated_noise=False`
 - `use_fast_auxiliary=False`
 - `use_kv_transform=False`
 - `use_knowledge_insulation=False`
@@ -160,14 +168,18 @@ checkpoint_base_dir="./outputs/checkpoints"
 학습 전에 normalization statistics를 계산해야 합니다.
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi_behavior_b1k_a100_baseline_stage_draft
+uv run scripts/compute_norm_stats.py \
+  --config-name pi_behavior_b1k_a100_baseline_stage_corr_draft \
+  --correlation
 ```
+
+correlated noise는 action correlation matrix가 필요하므로, 기존 non-correlation norm stats를 그대로 재사용하면 안 됩니다.
 
 FAST tokenizer는 기본 stage config에서 사용하지 않습니다. 나중에 FAST auxiliary를 다시 켤 때만 학습합니다.
 
 ```bash
 uv run scripts/train_fast_tokenizer.py \
-  --config-name pi_behavior_b1k_a100_baseline_stage_draft \
+  --config-name pi_behavior_b1k_a100_baseline_stage_corr_draft \
   --encoded-dims="0:6,7:23" \
   --vocab-size=1024
 ```
@@ -178,13 +190,13 @@ uv run scripts/train_fast_tokenizer.py \
 기존 `baseline_70k` 평가 점수가 낮게 나온 뒤, task embedding만으로는 복잡한 장기 task를 충분히 구분하기 어렵다는 가설을 확인하기 위한 재학습 경로입니다.
 
 ```bash
-uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --overwrite
+uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_corr_draft --overwrite
 ```
 
 기존 학습을 이어서 실행합니다.
 
 ```bash
-uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --resume
+uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_corr_draft --resume
 ```
 
 기본 설정은 다음과 같습니다.
@@ -201,7 +213,7 @@ uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --resume
 메모리가 안정적이고 GPU 사용률이 낮으면 70k stage config에서 batch size를 올려 볼 수 있습니다.
 
 ```bash
-uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft \
+uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_corr_draft \
   --batch_size=32 \
   --overwrite
 ```
@@ -212,22 +224,22 @@ uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft \
 uv run scripts/train.py pi_behavior_b1k_a100_baseline_draft --overwrite
 ```
 
-원래 70k baseline과 같은 길이로 비교하려면 아래 두 config를 사용합니다.
+70k 조건에서 비교하려면 아래 config를 사용합니다.
 
 ```bash
 # 70k 순수 task embedding baseline
 uv run scripts/train.py pi_behavior_b1k_a100_baseline_draft --overwrite
 
-# 70k baseline + System 2 stage tracking
-uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --overwrite
+# 70k baseline + System 2 stage tracking + correlated noise
+uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_corr_draft --overwrite
 ```
 
-즉 현재 비교 축은 `70k 순수 baseline`과 `70k stage tracking` 두 가지입니다.
+즉 v1의 핵심 비교 축은 `70k stage tracking baseline`과 `70k stage tracking + correlated noise`입니다.
 
 Weights & Biases logging을 끄려면 다음 옵션을 사용합니다.
 
 ```bash
-uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --wandb_enabled=false
+uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_corr_draft --wandb_enabled=false
 ```
 
 ## Policy Server 실행
@@ -237,7 +249,7 @@ uv run scripts/train.py pi_behavior_b1k_a100_baseline_stage_draft --wandb_enable
 ```bash
 uv run scripts/serve_b1k.py \
   policy:checkpoint \
-  --policy.config pi_behavior_b1k_a100_baseline_stage_draft \
+  --policy.config pi_behavior_b1k_a100_baseline_stage_corr_draft \
   --policy.dir /path/to/checkpoint
 ```
 
@@ -247,7 +259,7 @@ uv run scripts/serve_b1k.py \
 uv run scripts/serve_b1k.py \
   --port 8001 \
   policy:checkpoint \
-  --policy.config pi_behavior_b1k_a100_baseline_stage_draft \
+  --policy.config pi_behavior_b1k_a100_baseline_stage_corr_draft \
   --policy.dir /path/to/checkpoint
 ```
 
@@ -269,7 +281,7 @@ uv run scripts/serve_b1k.py \
 uv run scripts/serve_b1k.py \
   --task-checkpoint-mapping task_checkpoint_mapping.json \
   policy:checkpoint \
-  --policy.config pi_behavior_b1k_a100_baseline_stage_draft \
+  --policy.config pi_behavior_b1k_a100_baseline_stage_corr_draft \
   --policy.dir /path/to/initial/checkpoint
 ```
 

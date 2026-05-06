@@ -1006,11 +1006,17 @@ _CONFIGS.append(
 _CONFIGS.append(
     dataclasses.replace(
         _baseline_cfg,
-        # 70k baseline과 같은 조건에서 stage tracking만 추가한 공정 비교용 config.
-        name="pi_behavior_b1k_a100_baseline_stage_draft",
-        exp_name="a100_baseline_stage_draft",
+        # [2026-05-06]
+        # behavior1k 본 repo의 70k stage baseline에 correlated noise만 추가한 v1 config.
+        # 비교 축:
+        #   behavior1k:    task embedding + stage tracking + flow matching
+        #   behavior1k-v1: task embedding + stage tracking + flow matching + correlated noise
+        name="pi_behavior_b1k_a100_baseline_stage_corr_draft",
+        exp_name="a100_baseline_stage_corr_draft",
         model=dataclasses.replace(
             _baseline_cfg.model,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
             subtask_loss_weight=0.1,
         ),
         data=dataclasses.replace(
