@@ -19,6 +19,7 @@
 """
 
 import importlib
+import dataclasses
 import logging
 import os
 import time
@@ -34,11 +35,37 @@ LeRobotDatasetMetadata = getattr(lerobot_dataset, "LeRobotDatasetMetadata", None
 
 import openpi.models.model as _model
 import openpi.training.data_loader as _openpi_data_loader
+from b1k import transforms as b1k_transforms
 from b1k.training import config as _config
 from b1k.models.observation import Observation
 from b1k.configs.task_subset import SELECTED_TASKS
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_dataset_to_stage_transforms(
+    data_config: _config.DataConfig,
+    dataset: Dataset,
+) -> _config.DataConfig:
+    """Stage 계산 transform에 실제 dataset metadata를 연결한다."""
+    inputs = []
+    changed = False
+
+    for transform in data_config.model_transforms.inputs:
+        if isinstance(transform, b1k_transforms.ComputeSubtaskStateFromMeta):
+            inputs.append(dataclasses.replace(transform, dataset=dataset))
+            changed = True
+        else:
+            inputs.append(transform)
+
+    if not changed:
+        return data_config
+
+    model_transforms = dataclasses.replace(
+        data_config.model_transforms,
+        inputs=tuple(inputs),
+    )
+    return dataclasses.replace(data_config, model_transforms=model_transforms)
 
 
 # 전체 50개 task 구조는 유지하되, 실제 학습 데이터는 선택한 subset만 쓰기 위한 필터다.
@@ -550,6 +577,7 @@ def create_behavior_torch_data_loader(
         action_horizon=action_horizon,
         seed=seed,
     )
+    data_config = _attach_dataset_to_stage_transforms(data_config, dataset)
     dataset = _openpi_data_loader.transform_dataset(
         dataset,
         data_config,

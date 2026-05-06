@@ -6,9 +6,9 @@
 
 - 자연어 프롬프트 대신 task embedding 사용
 - action modeling은 flow matching 기반 유지
-- [`IliaLarchenko/behavior-1k-solution`](https://github.com/IliaLarchenko/behavior-1k-solution)의 아이디어를 참고해 correlated noise를 추가
+- [`IliaLarchenko/behavior-1k-solution`](https://github.com/IliaLarchenko/behavior-1k-solution)의 아이디어를 참고해 correlated noise와 System 2 stage tracking을 비교 실험용으로 추가
 
-즉, 이 저장소는 "1등팀 전체 기능 이식본"이 아니라, 기존 baseline 위에 correlated noise만 우선 얹어서 비교하기 쉽게 만든 버전입니다.
+즉, 이 저장소는 "1등팀 전체 기능 이식본"이 아니라, 기존 baseline 위에 correlated noise와 stage tracking을 단계별로 얹어서 비교하기 쉽게 만든 버전입니다.
 
 ## v1의 목적
 
@@ -16,6 +16,7 @@
 
 - baseline: task embedding + flow matching
 - v1: baseline + correlated noise
+- v1 stage: baseline + correlated noise + System 2 stage tracking
 
 이렇게 나누면 아래 두 설정을 직접 비교하기 쉽습니다.
 
@@ -29,8 +30,10 @@
 - `pi_behavior_b1k_baseline`
 - `pi_behavior_b1k_v1`
 - `pi_behavior_b1k_a100_week`
+- `pi_behavior_b1k_a100_week_stage`
 
 새 correlated-noise 버전을 쓰고 싶다면 `pi_behavior_b1k_v1`를 사용하면 됩니다.
+짧은 A100 실험에서 stage tracking까지 같이 보고 싶다면 `pi_behavior_b1k_a100_week_stage`를 사용하면 됩니다.
 
 ## `pi_behavior_b1k_v1`에서 달라진 점
 
@@ -44,6 +47,20 @@
 - `freeze_vision_backbone=True`
 
 따라서 `v1`은 "baseline + correlated noise" 실험 브랜치라고 보면 됩니다.
+
+## `pi_behavior_b1k_a100_week_stage`에서 달라진 점
+
+`pi_behavior_b1k_a100_week_stage`는 A100 week 설정에 System 2 stage tracking을 추가합니다.
+
+- `use_correlated_noise=True`
+- `correlation_beta=0.5`
+- `subtask_loss_weight=0.1`
+- `use_stage_conditioning=True`
+- `use_fast_auxiliary=False`
+- `use_kv_transform=False`
+
+모델 입력은 기존 `[local_task_id]` 대신 `[local_task_id, stage_id]`가 됩니다.
+stage id는 학습 데이터의 timestamp와 episode 길이로 만든 pseudo label입니다.
 
 ## 저장소 구조
 
@@ -127,7 +144,7 @@ PY
 
 ```bash
 uv run scripts/compute_norm_stats.py \
-  --config-name pi_behavior_b1k_v1 \
+  --config-name pi_behavior_b1k_a100_week_stage \
   --correlation
 ```
 
@@ -174,6 +191,27 @@ uv run scripts/train.py pi_behavior_b1k_a100_week --overwrite
 이 설정은 긴 `v1` 실험보다 빠르게 확인하고 싶을 때 유용합니다.
 이 레포에서는 이 A100 week 설정도 `v1` 방향에 맞춰 correlated noise를 켠 상태로 둡니다.
 
+### 4. 짧은 A100 + stage tracking 실험용 설정
+
+```bash
+uv run scripts/train.py pi_behavior_b1k_a100_week_stage --overwrite
+```
+
+이어서 학습:
+
+```bash
+uv run scripts/train.py pi_behavior_b1k_a100_week_stage --resume
+```
+
+기본 설정:
+
+- `num_train_steps=10000`
+- `batch_size=8`
+- correlated noise ON
+- System 2 stage tracking ON
+- FAST OFF
+- KV transform OFF
+
 ### W&B 사용
 
 ```bash
@@ -193,7 +231,7 @@ websocket policy server 실행:
 ```bash
 uv run scripts/serve_b1k.py \
   policy:checkpoint \
-  --policy.config pi_behavior_b1k_v1 \
+  --policy.config pi_behavior_b1k_a100_week_stage \
   --policy.dir /path/to/checkpoint
 ```
 
@@ -203,8 +241,18 @@ multi-checkpoint 모드:
 uv run scripts/serve_b1k.py \
   --task-checkpoint-mapping task_checkpoint_mapping.json \
   policy:checkpoint \
-  --policy.config pi_behavior_b1k_v1 \
+  --policy.config pi_behavior_b1k_a100_week_stage \
   --policy.dir /path/to/initial/checkpoint
+```
+
+stage tracking을 끄고 평가하려면:
+
+```bash
+uv run scripts/serve_b1k.py \
+  --no-use-stage-tracking \
+  policy:checkpoint \
+  --policy.config pi_behavior_b1k_a100_week \
+  --policy.dir /path/to/checkpoint
 ```
 
 다른 터미널에서 evaluation 실행:
