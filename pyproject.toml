@@ -1,7 +1,7 @@
 [project]
 name = "behavior1k-v1"
 version = "0.1.0"
-description = "BEHAVIOR-1K task-embedding flow-matching baseline with correlated noise v1"
+description = "BEHAVIOR-1K lightweight baseline with task embedding, stage tracking, and flow matching"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 

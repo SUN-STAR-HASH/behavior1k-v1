@@ -9,6 +9,7 @@
 3. 모델 내부 task embedding은 12개만 두고, 전역 task id를 로컬 0~11로 바꿔 넣는다.
 """
 
+import json
 import abc
 from collections.abc import Sequence
 import dataclasses
@@ -39,13 +40,14 @@ from b1k.training import weight_loaders
 from b1k import transforms as b1k_transforms
 from b1k.configs.task_subset import GLOBAL_TO_LOCAL, SELECTED_TASKS
 
-# Public note for this fork/repo:
-# `pi_behavior_b1k_baseline` keeps the task-embedding + flow-matching baseline,
-# while `pi_behavior_b1k_v1` enables only correlated noise on top of that
-# baseline so the change can be studied in isolation.
-
 ModelType: TypeAlias = _model.ModelType
 Filter: TypeAlias = nnx.filterlib.Filter
+
+def _load_episode_indices(path: str | None) -> list[int] | None:
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return [int(x) for x in json.load(f)]
 
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
@@ -120,24 +122,31 @@ class ModelTransformFactory(GroupFactory):
     use_stage_conditioning: bool = False
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        # [4/8] 나중에 prompt 구성이나 meta 처리에서 다시 건드릴 여지가 있어서 주석 처리
         inputs: list[_transforms.DataTransformFn] = [
             _transforms.ResizeImages(224, 224),
         ]
 
         if self.use_stage_conditioning:
-            inputs.extend(
-                [
-                    b1k_transforms.ComputeSubtaskStateFromMeta(
-                        task_mapping=GLOBAL_TO_LOCAL,
-                    ),
-                    b1k_transforms.TaskIndexToTaskId(
-                        task_mapping=GLOBAL_TO_LOCAL,
-                        include_subtask_state=True,
-                    ),
-                ]
-            )
+            # Stage tracking 학습 경로:
+            #   1. timestamp / episode length로 현재 stage id를 계산한다.
+            #   2. tokenized_prompt를 [local_task_id, stage_id] 형태로 만든다.
+            #
+            # ComputeSubtaskStateFromMeta의 dataset 필드는 data_loader에서
+            # 실제 dataset 생성 후 채워 준다.
+            inputs.extend([
+                b1k_transforms.ComputeSubtaskStateFromMeta(
+                    task_mapping=GLOBAL_TO_LOCAL,
+                ),
+                b1k_transforms.TaskIndexToTaskId(
+                    task_mapping=GLOBAL_TO_LOCAL,
+                    include_subtask_state=True,
+                ),
+            ])
         else:
             inputs.append(
+                # 전역 task id(원본 데이터셋 기준)를 subset 로컬 id(0~11)로 바꾼다.
+                # stage는 기본 경로에서 사용하지 않으므로 tokenized_prompt는 [task_id]만 만든다.
                 b1k_transforms.TaskIndexToTaskId(task_mapping=GLOBAL_TO_LOCAL)
             )
 
@@ -453,51 +462,6 @@ _CONFIGS = [
             use_kv_transform=False,
             use_knowledge_insulation=False,
 
-            subtask_loss_weight=0.0,
-            freeze_vision_backbone=True,
-        ),
-        data=LeRobotB1KDataConfig(
-            repo_id="IliaLarchenko/behavior_224_rgb",
-            base_config=DataConfig(
-                prompt_from_task=False,
-                behavior_dataset_root="~/data/behavior_224_rgb",
-                use_per_timestamp_norm=False,
-            ),
-            use_delta_joint_actions=False,
-            use_fast_tokenization=False,
-        ),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,
-            peak_lr=1e-4,
-            decay_steps=20_000,
-            decay_lr=1e-5,
-        ),
-        num_flow_samples=1,
-        weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-        num_train_steps=30_000,
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=8,
-        batch_size=16,
-        save_interval=1000,
-        keep_period=5000,
-    ),
-
-    TrainConfig(
-        name="pi_behavior_b1k_v1",
-        exp_name="v1",
-        project_name="B1K",
-        model=pi_behavior_config.PiBehaviorConfig(
-            action_horizon=30,
-            action_dim=32,
-            use_correlated_noise=True,
-            correlation_beta=0.5,
-            use_fast_auxiliary=False,
-            fast_loss_weight=0.0,
-            use_kv_transform=False,
-            use_knowledge_insulation=False,
             subtask_loss_weight=0.0,
             freeze_vision_backbone=True,
         ),
@@ -862,6 +826,10 @@ _CONFIGS = [
 
                 # smoke에서는 per-timestamp normalization은 일단 끔
                 use_per_timestamp_norm=False,
+
+                episodes_index=_load_episode_indices(
+                    "outputs/assets/task_subsets/selected12_episodes_parquet_verified.json"
+                ),
             ),
 
             # baseline smoke이므로 action 변환도 단순하게 유지
@@ -902,7 +870,7 @@ _CONFIGS = [
         checkpoint_base_dir="./outputs/checkpoints",
 
         # A100이라도 smoke 단계에서는 너무 크게 안 잡고 시작
-        num_workers=2,
+        num_workers=0, # 원래 2, 잠깐 수정
         batch_size=4,
 
         # 필요하면 True로 바꿔도 되지만,
@@ -916,148 +884,218 @@ _CONFIGS = [
         val_num_batches=1,
     ),
 
-    TrainConfig(
-        # A100 한 장으로 1주일 안에 끝내는 것을 목표로 한 실제 baseline 실험 설정.
-        #
-        # 1등팀의 200k step / 8xH200 학습을 그대로 따라가면 A100 1장에서는
-        # 시간이 너무 오래 걸린다. 그래서 이 설정은 "대회 재현"이 아니라
-        # "12개 task subset에서 빠르게 비교 가능한 baseline checkpoint 만들기"가 목적이다.
-        #
-        # 실행 예:
-        # uv run scripts/train.py pi_behavior_b1k_a100_week --overwrite
-        #
-        # 중간에 끊겼을 때 이어서 실행:
-        # uv run scripts/train.py pi_behavior_b1k_a100_week --resume
-        name="pi_behavior_b1k_a100_week",
-        exp_name="a100_week_10k",
-        project_name="B1K",
+]
 
-        model=pi_behavior_config.PiBehaviorConfig(
-            action_horizon=30,
-            action_dim=32,
+# [2026-04-18] A100 smoke 기반 batch_size=8 확인용 짧은 테스트
+_smoke_cfg = next(c for c in _CONFIGS if c.name == "pi_behavior_b1k_a100_smoke")
 
-            # ---- v1 week-scale setting ----
-            # 여기서는 A100 1장으로도 빠르게 검증할 수 있도록
-            # baseline 구조 위에 correlated noise만 반영한다.
-            use_correlated_noise=True,
-            correlation_beta=0.5,
-            use_fast_auxiliary=False,
-            fast_loss_weight=0.0,
-            use_kv_transform=False,
-            use_knowledge_insulation=False,
-            subtask_loss_weight=0.0,
-
-            # A100 1장에서는 전체 vision backbone까지 같이 학습하면 메모리와 시간이 커진다.
-            # 우선 backbone은 freeze해서 task embedding / action expert 쪽 실험을 빠르게 본다.
-            freeze_vision_backbone=True,
-        ),
-
-        data=LeRobotB1KDataConfig(
-            repo_id="IliaLarchenko/behavior_224_rgb",
-            base_config=DataConfig(
-                prompt_from_task=False,
-                behavior_dataset_root="/home/data/datasets/behavior_224_rgb",
-                use_per_timestamp_norm=False,
+# [2026-04-19 수정]
+# 목적:
+# - bs16은 성공했고 bs32는 OOM이었으므로, 그 중간값인 bs20이 안정적으로 도는지 확인
+# - 이번 run은 학습 성능보다 OOM 여부 / 짧은 구간 안정성 확인이 목적
+# 설정 이유:
+# - num_train_steps=20으로 짧게 두어 위험도를 낮춤
+# - save_interval을 크게 두어 checkpoint 저장 오버헤드 없이 순수 학습 생존만 확인
+_CONFIGS.append(
+    dataclasses.replace(
+        _smoke_cfg,
+        name="pi_behavior_b1k_a100_smoke_bs28_w8_check",
+        exp_name="a100_smoke_bs28_w8_check",
+        data=dataclasses.replace(
+            _smoke_cfg.data,
+            assets=AssetsConfig(
+                assets_dir="/home/data/projects/behavior1k/outputs/assets/pi_behavior_b1k_a100_smoke",
+                asset_id="IliaLarchenko/behavior_224_rgb",
             ),
-            use_delta_joint_actions=False,
-            use_fast_tokenization=False,
         ),
+        batch_size=28,
+        num_workers=8,
+        num_train_steps=20,
+        log_interval=1,
+        save_interval=1000,
+        keep_period=1000,
+        wandb_enabled=False,
+        overwrite=False,
+        resume=False,
+    )
+)
 
+# [2026-04-19] A100 본 실험용 초안
+# - 현재 실제로 완주한 pi_behavior_b1k_a100_smoke를 기반으로 함
+# - norm stats는 smoke에서 이미 검증된 asset 경로를 재사용
+_smoke_cfg = next(c for c in _CONFIGS if c.name == "pi_behavior_b1k_a100_smoke")
+
+_CONFIGS.append(
+    dataclasses.replace(
+        _smoke_cfg,
+        name="pi_behavior_b1k_a100_baseline_draft",
+        exp_name="a100_baseline_draft",
+        data=dataclasses.replace(
+            _smoke_cfg.data,
+            assets=AssetsConfig(
+                assets_dir="/home/data/projects/behavior1k/outputs/assets/pi_behavior_b1k_a100_smoke",
+                asset_id="IliaLarchenko/behavior_224_rgb",
+            ),
+        ),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            # 10k step짜리 짧은 실험이라 warmup도 짧게 잡는다.
-            warmup_steps=500,
+            warmup_steps=1000,
             peak_lr=1e-4,
-            decay_steps=10_000,
+            decay_steps=20_000,
             decay_lr=1e-5,
         ),
-
-        num_flow_samples=1,
-        weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-
-        # 200k step 대신 10k step으로 줄여 1주일 안에 끝나는 실험을 목표로 한다.
-        # 첫 500~1000 step의 step/sec 로그를 보고 너무 느리면 5k로 낮춰도 된다.
-        num_train_steps=10_000,
-        log_interval=50,
+        batch_size=28,   # [2026-04-19 수정] bs8 -> bs28
+        num_workers=6,   # [2026-04-19 수정] w4 -> w6
+        num_train_steps=70_000, # [2026-04-22 수정] train_steps=30_000 -> train_steps=70_000
+        log_interval=10,
         save_interval=1000,
-        keep_period=2000,
-
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-
-        # A100 40GB/80GB 모두에서 먼저 시도하기 좋은 보수적인 값.
-        # OOM이 안 나고 GPU utilization이 낮으면 CLI에서 --batch_size=12 또는 16으로 올린다.
-        num_workers=4,
-        batch_size=8,
-
+        keep_period=5000,
         wandb_enabled=True,
-        fsdp_devices=1,
-        val_num_batches=2,
-    ),
+        overwrite=False,
+        resume=False,
+    )
+)
 
-    TrainConfig(
-        # v1의 A100 week 설정에 System 2 stage tracking을 추가한 비교 실험 설정.
-        #
-        # pi_behavior_b1k_a100_week:
-        #   task embedding + flow matching + correlated noise
-        #
-        # pi_behavior_b1k_a100_week_stage:
-        #   task embedding + flow matching + correlated noise + stage tracking
-        name="pi_behavior_b1k_a100_week_stage",
-        exp_name="a100_week_stage_10k",
-        project_name="B1K",
-
-        model=pi_behavior_config.PiBehaviorConfig(
-            action_horizon=30,
-            action_dim=32,
-
-            # ---- v1 유지 + stage tracking 추가 ----
-            use_correlated_noise=True,
-            correlation_beta=0.5,
-            use_fast_auxiliary=False,
-            fast_loss_weight=0.0,
-            use_kv_transform=False,
-            use_knowledge_insulation=False,
-            subtask_loss_weight=0.1,
-            freeze_vision_backbone=True,
-        ),
-
-        data=LeRobotB1KDataConfig(
-            repo_id="IliaLarchenko/behavior_224_rgb",
-            base_config=DataConfig(
-                prompt_from_task=False,
-                behavior_dataset_root="/home/data/datasets/behavior_224_rgb",
-                use_per_timestamp_norm=False,
+_CONFIGS.append(
+    dataclasses.replace(
+        _smoke_cfg,
+        name="pi_behavior_b1k_a100_baseline_wandb_check",
+        exp_name="a100_baseline_wandb_check",
+        data=dataclasses.replace(
+            _smoke_cfg.data,
+            assets=AssetsConfig(
+                assets_dir="/home/data/projects/behavior1k/outputs/assets/pi_behavior_b1k_a100_smoke",
+                asset_id="IliaLarchenko/behavior_224_rgb",
             ),
-            use_delta_joint_actions=False,
-            use_fast_tokenization=False,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        batch_size=28,
+        num_workers=6,
+        num_train_steps=30,
+        save_interval=30,
+        log_interval=5,
+        keep_period=20,
+        wandb_enabled=True,
+        overwrite=False,
+        resume=False,
+    )
+)
+
+# [2026-04-19 수정] 본 실험과 동일 조건의 1000-step pilot
+# - step만 1000으로 줄이고 나머지는 baseline draft와 동일
+# - bs28, w6 조건을 그대로 재사용
+_baseline_cfg = next(c for c in _CONFIGS if c.name == "pi_behavior_b1k_a100_baseline_draft")
+
+_CONFIGS.append(
+    dataclasses.replace(
+        _baseline_cfg,
+        name="pi_behavior_b1k_a100_baseline_1000pilot",
+        exp_name="a100_baseline_1000pilot",
+        num_train_steps=1000,
+        overwrite=False,
+        resume=False,
+    )
+)
+
+# [2026-04-27 수정] FAST auxiliary 실험용 config
+# baseline과 동일 조건에서 use_fast_auxiliary만 켠 비교 실험
+_CONFIGS.append(
+    dataclasses.replace(
+        _baseline_cfg,
+        # 70k baseline과 같은 조건에서 stage tracking만 추가한 공정 비교용 config.
+        name="pi_behavior_b1k_a100_baseline_stage_draft",
+        exp_name="a100_baseline_stage_draft",
+        model=dataclasses.replace(
+            _baseline_cfg.model,
+            subtask_loss_weight=0.1,
+        ),
+        data=dataclasses.replace(
+            _baseline_cfg.data,
             use_stage_conditioning=True,
         ),
+        num_train_steps=70_000,
+        batch_size=28,
+        num_workers=6,
+        overwrite=False,
+        resume=False,
+    )
+)
 
+_CONFIGS.append(
+    dataclasses.replace(
+        _smoke_cfg,
+        name="pi_behavior_b1k_a100_fast_aux_draft",
+        exp_name="a100_fast_aux_draft",
+        model=dataclasses.replace(
+            _smoke_cfg.model,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+        ),
+        data=dataclasses.replace(
+            _smoke_cfg.data,
+            assets=AssetsConfig(
+                assets_dir="/home/data/projects/behavior1k/outputs/assets/pi_behavior_b1k_a100_smoke",
+                asset_id="IliaLarchenko/behavior_224_rgb",
+            ),
+        ),
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500,
+            warmup_steps=1000,
             peak_lr=1e-4,
-            decay_steps=10_000,
+            decay_steps=20_000,
             decay_lr=1e-5,
         ),
-        num_flow_samples=1,
-        weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
-        num_train_steps=10_000,
-        log_interval=50,
+        batch_size=28,
+        num_workers=6,
+        num_train_steps=70_000,
+        log_interval=10,
         save_interval=1000,
-        keep_period=2000,
-        assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints",
-        num_workers=4,
-        batch_size=8,
+        keep_period=5000,
         wandb_enabled=True,
-        fsdp_devices=1,
-        val_num_batches=2,
-    ),
-]
+        overwrite=False,
+        resume=False,
+    )
+)
+
+# [2026-04-27 수정] smoke용 FAST auxiliary 실험용 config
+# baseline과 동일 조건에서 use_fast_auxiliary만 켠 비교 실험
+_CONFIGS.append(
+    dataclasses.replace(
+        _smoke_cfg,
+        name="pi_behavior_b1k_fast_aux_oom20",
+        exp_name="fast_aux_oom20",
+        model=dataclasses.replace(
+            _smoke_cfg.model,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+        ),
+        data=dataclasses.replace(
+            _smoke_cfg.data,
+            assets=AssetsConfig(
+assets_dir="/home/data/projects/behavior1k/outputs/assets/pi_behavior_b1k_a100_smoke",
+                asset_id="IliaLarchenko/behavior_224_rgb",
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        batch_size=28,
+        num_workers=6,
+        num_train_steps=20,
+        log_interval=1,
+        save_interval=1000,
+        keep_period=5000,
+        wandb_enabled=True,
+        overwrite=True,
+        resume=False,
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

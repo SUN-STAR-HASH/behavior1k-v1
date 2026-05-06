@@ -50,6 +50,7 @@ from b1k.models.pi_behavior_config import PiBehaviorConfig
 from b1k.models.observation import Observation
 
 
+
 def init_logging():
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -91,9 +92,70 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
-# [4/9 추가]
+# [2026-04-22 수정]
+# 설명:
+# - baseline / 비교실험용으로 W&B에 필요한 scalar metric만 최소 로깅
+# - action_loss, subtask_loss, learning_rate, step, GPU peak까지 포함
+# - 없는 키는 자동으로 건너뜀
+
+def build_minimal_wandb_payload(
+    reduced_info: dict[str, Any],
+    *,
+    step_time_sec: float | None = None,
+    gpu_mem_peak_mib: float | None = None,
+    learning_rate: float | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+
+    keep_keys = [
+        "loss",
+        "total_loss",
+        "action_loss",
+        "subtask_loss",
+        "grad_norm",
+        "param_norm",
+        "subtask_accuracy",
+        "grad_norm_vlm",
+        "grad_norm_action_expert",
+    ]
+
+    def _to_py_scalar(x):
+        if hasattr(x, "item"):
+            return x.item()
+        return x
+
+    for key in keep_keys:
+        if key in reduced_info:
+            payload[key] = _to_py_scalar(reduced_info[key])
+
+    if step_time_sec is not None:
+        payload["step_time"] = float(step_time_sec)
+
+    if gpu_mem_peak_mib is not None:
+        payload["gpu_mem_peak_mib"] = float(gpu_mem_peak_mib)
+
+    if learning_rate is not None:
+        payload["learning_rate"] = float(learning_rate)
+
+    return payload
+
+# [2026-04-19 수정]
+# 목적:
+# - 기존에는 "현재 시점의 GPU 메모리"만 찍었음
+# - 이제는 실행 중 관측된 최대값(peak_seen)도 같이 기록해서
+#   bs16 테스트에서 어느 구간이 가장 위험한지 바로 확인하려는 용도
+_GPU_MEM_PEAK_MIB = 0
+
+def reset_gpu_mem_peak():
+    """[2026-04-19 수정] peak 추적값을 새 구간 시작 전에 초기화한다."""
+    global _GPU_MEM_PEAK_MIB
+    _GPU_MEM_PEAK_MIB = 0
+
 def log_gpu_mem(tag: str):
-    """현재 GPU 메모리 사용량을 로그로 찍는다."""
+    """[2026-04-19 수정]
+    현재 GPU 메모리 사용량과 지금까지 관측한 최대 사용량(peak_seen)을 함께 로그로 찍는다.
+    """
+    global _GPU_MEM_PEAK_MIB
     try:
         out = subprocess.check_output(
             [
@@ -103,14 +165,19 @@ def log_gpu_mem(tag: str):
             ],
             text=True,
         ).strip().splitlines()[0]
+
         used, total = [int(x.strip()) for x in out.split(",")]
-        logging.info(f"[GPU MEM] {tag}: {used} MiB / {total} MiB")
+        _GPU_MEM_PEAK_MIB = max(_GPU_MEM_PEAK_MIB, used)
+
+        logging.info(
+            f"[GPU MEM] {tag}: {used} MiB / {total} MiB "
+            f"(peak_seen={_GPU_MEM_PEAK_MIB} MiB)"
+        )
     except Exception as e:
         logging.info(f"[GPU MEM] {tag}: unavailable ({e})")
-#############################
 
 def block_and_log(tag: str, x=None):
-    """JAX 계산을 끝까지 block한 뒤 GPU 메모리 로그를 찍는다."""
+    """기존과 동일하게 JAX 계산을 끝까지 block한 뒤 GPU 메모리 로그를 찍는다."""
     if x is not None:
         jax.block_until_ready(x)
     log_gpu_mem(tag)
@@ -118,7 +185,7 @@ def block_and_log(tag: str, x=None):
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    
+
     # Filter out nnx.Intermediate fields from both sides (they're not params, excluded from checkpoints)
     # This allows loading old checkpoints that didn't have these fields
     def filter_intermediate_fields(params_dict):
@@ -135,15 +202,15 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
             'cached_Sigma_ou_Sigma_uu_inv',  # Conditional sampling cache
             'cached_L_cond_inp',             # Conditional sampling cache
         ]
-        filtered = {k: v for k, v in flat.items() 
+        filtered = {k: v for k, v in flat.items()
                    if not any(field in str(k) for field in intermediate_field_names)}
         return traverse_util.unflatten_dict(filtered)
-    
-    # Validate loaded params structure  
+
+    # Validate loaded params structure
     params_shape_filtered = filter_intermediate_fields(params_shape)
     loaded_params_filtered = filter_intermediate_fields(loaded_params)
     at.check_pytree_equality(expected=params_shape_filtered, got=loaded_params_filtered, check_shapes=True, check_dtypes=True)
-    
+
     # Remove jax.ShapeDtypeStruct and Intermediate fields from the loaded params
     def should_exclude(k, v):
         if isinstance(v, jax.ShapeDtypeStruct):
@@ -156,19 +223,19 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
             'cached_Sigma_ou_Sigma_uu_inv', 'cached_L_cond_inp',
         ]
         return any(field in str(k) for field in intermediate_field_names)
-    
+
     return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() 
+        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items()
          if not should_exclude(k, v)}
     )
 
 
 @at.typecheck
 def init_train_state(
-    config: _config.TrainConfig, 
-    init_rng: at.KeyArrayLike, 
-    mesh: jax.sharding.Mesh, 
-    *, 
+    config: _config.TrainConfig,
+    init_rng: at.KeyArrayLike,
+    mesh: jax.sharding.Mesh,
+    *,
     resume: bool,
     norm_stats: dict | None = None
 ) -> tuple[training_utils.TrainState, Any]:
@@ -178,7 +245,7 @@ def init_train_state(
         rng, model_rng = jax.random.split(rng)
         # initialize the model (and its parameters).
         model = config.model.create(model_rng)
-        
+
         # Load correlation matrix into PiBehavior models BEFORE creating graphdef
         if isinstance(model, PiBehavior) and norm_stats is not None:
             model.load_correlation_matrix(norm_stats)
@@ -219,27 +286,27 @@ def init_train_state(
         in_shardings=replicated_sharding,
         out_shardings=state_sharding,
     )(init_rng, partial_params)
-    
+
     # Log KV transform coefficients for PiBehavior models
     model = nnx.merge(train_state.model_def, train_state.params)
     if isinstance(model, PiBehavior) and hasattr(model, 'kv_transform') and model.kv_transform is not None:
         logging.info("KV Transform Coefficients (after loading):")
         logging.info("=" * 80)
-        
+
         k_coeffs = model.kv_transform.k_coeffs.value
         v_coeffs = model.kv_transform.v_coeffs.value
-        
+
         logging.info("K Coefficients (each layer attends to all VLM layers):")
         for i in range(k_coeffs.shape[0]):
             coeffs_str = ", ".join([f"{float(c):.2f}" for c in k_coeffs[i]])
             logging.info(f"  Layer {i:2d}: [{coeffs_str}]")
-        
+
         logging.info("")
         logging.info("V Coefficients (each layer attends to all VLM layers):")
         for i in range(v_coeffs.shape[0]):
             coeffs_str = ", ".join([f"{float(c):.2f}" for c in v_coeffs[i]])
             logging.info(f"  Layer {i:2d}: [{coeffs_str}]")
-        
+
         logging.info("=" * 80)
 
     return train_state, state_sharding
@@ -255,7 +322,7 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck  
+    @at.typecheck
     def loss_fn(
         model: PiBehavior, rng: at.KeyArrayLike, observation: Observation, actions: _model.Actions
     ):
@@ -269,12 +336,12 @@ def train_step(
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, losses_dict), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(model, train_rng, observation, actions)
-    
+
     # Knowledge insulation gradient monitoring
     if config.model.use_knowledge_insulation:
         # Helper functions to identify parameter groups
         def is_action_expert_param(path_str):
-            # Action expert parameters: 
+            # Action expert parameters:
             # - Second LLM expert (300M params, marked with _1 suffix)
             # - Action projections, time MLPs, kv_transform
             return any(x in path_str for x in [
@@ -285,11 +352,11 @@ def train_step(
                 "time_mlp_out",
                 "kv_transform"
             ])
-        
+
         def is_vlm_param(path_str):
             # VLM parameters: everything else (first expert, img, FAST, task modules)
             return not is_action_expert_param(path_str)
-        
+
         # Compute gradient norms for monitoring only (no scaling applied)
         def compute_group_norm(grads_state, predicate):
             """Compute norm for gradients matching predicate."""
@@ -301,11 +368,11 @@ def train_step(
                         flat_grads.append(value.value if hasattr(value, 'value') else value)
                     else:
                         flat_grads.append(value)
-            
+
             if flat_grads:
                 return jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in flat_grads))
             return 0.0
-        
+
         grad_norm_vlm = compute_group_norm(grads, is_vlm_param)
         grad_norm_action = compute_group_norm(grads, is_action_expert_param)
     else:
@@ -343,7 +410,7 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
-    
+
     # Add gradient norm breakdown for knowledge insulation monitoring
     if grad_norm_vlm is not None:
         info["grad_norm_vlm"] = grad_norm_vlm
@@ -374,7 +441,7 @@ def main(config: _config.TrainConfig):
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed for JAX RNG: {seed}")
-    
+
     rng = jax.random.key(seed)
     train_rng, init_rng = jax.random.split(rng)
 
@@ -406,16 +473,14 @@ def main(config: _config.TrainConfig):
 
     log_gpu_mem("after first batch")
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
-    ###############################
 
-    # [4/8] 나중에 smoke patch 위해 수정
-    # Log images from first batch to sanity check.
+    ###############################
+    # [2026-04-22 수정]
+    # 설명:
+    # - baseline 장기 학습에서는 첫 batch 이미지 업로드를 끔
+    # - W&B는 숫자(metric)만 남기고, 이미지 로깅 오버헤드는 피하기 위함
     if config.wandb_enabled:
-        images_to_log = [
-            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-            for i in range(min(5, len(next(iter(batch[0].images.values())))))
-        ]
-        wandb.log({"camera_views": images_to_log}, step=0)
+        logging.info("W&B image logging is disabled for baseline/minimal tracking.")
     ###################################
 
     # Get norm_stats for correlation matrix loading
@@ -444,7 +509,7 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
-        
+
         # [4/9 추가]
         block_and_log("after restore_state", train_state)
         ##############
@@ -456,26 +521,40 @@ def main(config: _config.TrainConfig):
             logging.info("Reloaded correlation matrix after checkpoint restore")
             train_state = dataclasses.replace(train_state, model_def=nnx.graphdef(model))
 
+    lr_fn = config.lr_schedule.create()
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
+        # [2026-04-22 추가]
+        # lr schedule config 객체 -> 실제 callable schedule 함수
     )
 
-    # [4/9 추가]
+    # [2026-04-19 수정]
+    # 목적:
+    # - 첫 ptrain_step은 보통 compile + 실제 첫 forward/backward가 겹쳐서 메모리 피크가 크게 나타날 수 있음
+    # - 그래서 이 구간만 따로 peak를 초기화하고, 끝난 직후 peak를 요약 출력
+    reset_gpu_mem_peak()
     log_gpu_mem("before first ptrain_step")
 
     try:
         train_state, info = ptrain_step(train_rng, train_state, batch)
         block_and_log("after first ptrain_step", info["loss"])
+        logging.info(f"[GPU MEM] first ptrain_step peak={_GPU_MEM_PEAK_MIB} MiB")
         logging.info(f"[TRACE] first step loss={float(jax.device_get(info['loss'])):.6f}")
     except Exception:
         logging.exception("[TRACE] failed during first ptrain_step")
         raise
-    ################
 
     start_step = int(train_state.step)
+
+    # [2026-04-19 수정]
+    # 목적:
+    # - 첫 ptrain_step peak와, 이후 train loop 전체 peak를 분리해서 보기 위함
+    reset_gpu_mem_peak()
+
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -485,22 +564,67 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        step_start_time = time.time()
+
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+
+        step_time_sec = time.time() - step_start_time
         infos.append(info)
+
+        # [2026-04-19 수정]
+        # 목적:
+        # - 각 step 직후 메모리 사용량을 남겨서
+        #   bs16에서 특정 step부터 급격히 증가하는지 확인
+        block_and_log(f"step {step}", info["loss"])
+
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            
-            # Create a concise console log with main metrics
-            main_metrics = {k: v for k, v in reduced_info.items() 
-                          if "loss" in k or "accuracy" in k or k in ["grad_norm", "param_norm", "grad_norm_vlm", "grad_norm_action_expert"]}
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in main_metrics.items())
-            pbar.write(f"Step {step}: {info_str}")
-            
-            if config.wandb_enabled:
-                wandb.log(reduced_info, step=step)
+            current_lr = float(lr_fn(step))
 
+            # Create a concise console log with main metrics
+            main_metrics = {
+                k: v for k, v in reduced_info.items()
+                if k in [
+                    "loss",
+                    "total_loss",
+                    "action_loss",
+                    "subtask_loss",
+                    "subtask_accuracy",
+                    "grad_norm",
+                    "param_norm",
+                    "grad_norm_vlm",
+                    "grad_norm_action_expert",
+                ]
+            }
+            main_metrics["learning_rate"] = current_lr
+            main_metrics["step_time"] = step_time_sec
+            main_metrics["gpu_mem_peak_mib"] = _GPU_MEM_PEAK_MIB
+
+            def _fmt_metric(v):
+                if hasattr(v, "item"):
+                    v = v.item()
+                if isinstance(v, (float, int)):
+                    return f"{v:.8g}"
+                return str(v)
+
+            info_str = ", ".join(f"{k}={_fmt_metric(v)}" for k, v in main_metrics.items())
+            pbar.write(f"Step {step}: {info_str}")
+
+            if config.wandb_enabled:
+                # [2026-04-22 수정]
+                # 설명:
+                # - W&B에는 비교실험에 필요한 최소 scalar만 기록
+                # - reduced_info 전체 업로드 대신 필요한 항목만 선별
+                wandb_payload = build_minimal_wandb_payload(
+                    reduced_info,
+                    step_time_sec=step_time_sec,
+                    gpu_mem_peak_mib=_GPU_MEM_PEAK_MIB,
+                    learning_rate=current_lr,
+                )
+                logging.info(f"[W&B PAYLOAD] step={step} payload_keys={list(wandb_payload.keys())} payload={wandb_payload}")
+                wandb.log(wandb_payload, step=step)
             infos = []
         batch = next(data_iter)
 
@@ -510,6 +634,10 @@ def main(config: _config.TrainConfig):
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
 
+    # [2026-04-19 수정]
+    # 목적:
+    # - 전체 train loop에서 관측된 최대 GPU 메모리를 마지막에 한 번 더 요약
+    logging.info(f"[GPU MEM] max observed during train loop: {_GPU_MEM_PEAK_MIB} MiB")
 
 if __name__ == "__main__":
     main(_config.cli())

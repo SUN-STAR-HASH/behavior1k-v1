@@ -82,12 +82,18 @@ class TaskIndexToTaskId(DataTransformFn):
             
             # 학습 데이터는 보통 global task_index를 갖고 있다.
             # 모델 embedding은 local id를 요구하므로 mapping이 있으면 반드시 변환한다.
-            if self.task_mapping is not None:
-                if task_index not in self.task_mapping:
-                    raise ValueError(f"task_index {task_index} not found in mapping")
+            if task_index in self.task_mapping:
                 task_id = self.task_mapping[task_index]
             else:
-                task_id = task_index
+                episode_index = data.get("episode_index", None)
+                sample_index = data.get("index", None)
+                timestamp = data.get("timestamp", None)
+                raise ValueError(
+                    f"task_index {task_index} not found in mapping; "
+                    f"episode_index={episode_index}, index={sample_index}, "
+                    f"timestamp={timestamp}, allowed={sorted(self.task_mapping.keys())}"
+                )
+
         else:
             # During inference, if neither is provided, this transform should be skipped
             # The tokenized_prompt should already be set up correctly
@@ -99,21 +105,27 @@ class TaskIndexToTaskId(DataTransformFn):
             # Stage tracking 경로에서는 tokenized_prompt 두 칸을 쓴다.
             #   [0] = local task id
             #   [1] = 현재 stage id
+            #
+            # subtask_state가 없으면 stage 0으로 시작한다. 이렇게 하면 smoke/fallback에서도
+            # shape은 유지되고, 실데이터에서는 ComputeSubtaskStateFromMeta가 값을 채워 준다.
             subtask_state = int(data.get("subtask_state", 0))
             prompt_tokens = np.array([task_id, subtask_state], dtype=np.int32)
             prompt_mask = np.array([True, True], dtype=bool)
         else:
             # 기본 경로는 stage 토큰을 따로 붙이지 않는다.
             # 최종적으로 local task id 하나만 모델에 전달한다.
+            #
+            # shape이 [1]인 이유:
+            #   모델 쪽에서 batch를 만들면 [B, 1]이 된다.
+            #   두 번째 값(stage id)을 붙이면 [B, 2]가 되고 stage conditioning 경로가 열린다.
             prompt_tokens = np.array([task_id], dtype=np.int32)
             prompt_mask = np.array([True], dtype=bool)
 
-        return {
-            **data,
-            "tokenized_prompt": prompt_tokens,
-            "tokenized_prompt_mask": prompt_mask
-        }
-
+        data = dict(data)
+        data["task_id"] = task_id
+        data["tokenized_prompt"] = prompt_tokens
+        data["tokenized_prompt_mask"] = prompt_mask
+        return data
 
 @dataclasses.dataclass(frozen=True)
 class ComputeSubtaskStateFromMeta(DataTransformFn):
@@ -162,6 +174,9 @@ class ComputeSubtaskStateFromMeta(DataTransformFn):
         timestamp = float(data["timestamp"])
         task_index = int(data["task_index"])
 
+        # task_index는 원본 BEHAVIOR global id다.
+        # TASK_NUM_STAGES는 현재 12-task subset의 local id 순서로 만들어져 있으므로
+        # stage 수를 조회하기 전에 global -> local 변환을 해야 한다.
         if self.task_mapping is not None:
             if task_index not in self.task_mapping:
                 logging.warning(f"task_index {task_index} not found in task_mapping, using stage 0")

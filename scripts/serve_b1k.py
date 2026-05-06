@@ -8,11 +8,6 @@ import socket
 import numpy as np
 import tyro
 
-# Typical usage for this repository:
-#   uv run scripts/serve_b1k.py policy:checkpoint \
-#       --policy.config pi_behavior_b1k_a100_week_stage \
-#       --policy.dir /path/to/checkpoint
-
 # Set JAX memory allocation before importing JAX (can be overridden by env vars)
 os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.5')  # Use 50% of GPU memory
 os.environ.setdefault('XLA_PYTHON_CLIENT_ALLOCATOR', 'platform')  # Platform allocator
@@ -69,7 +64,7 @@ class Args:
     tyro를 쓰기 때문에 아래 dataclass 필드들이 자동으로 CLI 옵션이 된다.
     예:
         uv run scripts/serve_b1k.py policy:checkpoint \
-            --policy.config pi_behavior_b1k_a100_week_stage \
+            --policy.config pi_behavior_b1k_a100_baseline_stage_draft \
             --policy.dir ~/models/checkpoint_1 \
             --port 8000
     """

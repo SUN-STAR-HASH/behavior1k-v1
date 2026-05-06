@@ -172,10 +172,30 @@ class PiBehaviorPolicy(Policy):
 
         start_time = time.monotonic()
 
-        # PiBehavior.sample_actions()는 (actions, subtask_logits) 튜플을 반환한다.
+        # PiBehavior.sample_actions()는 (actions, subtask_logits) 튜플을 반환
         # 이것이 이 클래스가 존재하는 유일한 이유이다.
-        # 부모 클래스는 단순 배열 반환을 기대하므로 여기서 언패킹한다.
-        actions, subtask_logits = self._sample_actions(sample_rng, observation, **sample_kwargs)
+        # 부모 클래스는 단순 백업 batch를 기대하므로 여기서 언패킹한다.
+
+        # [수정일: 2026-04-29]
+        # [수정 이유]
+        # PiBehavior.sample_actions()가 initial_actions와 subtask_logits 반환을
+        # 정식 지원하도록 수정되었으므로, 더 이상 initial_actions를 제거하지 않는다.
+        #
+        # 기존 임시 패치:
+        # sample_kwargs.pop("initial_actions", None)
+        #
+        # 위 코드는 rolling inpainting 정보를 버리므로 제거한다.
+        # 이제 sample_actions()는 항상 (actions, subtask_logits)를 반환해야 한다.
+        sample_result = self._sample_actions(sample_rng, observation, **sample_kwargs)
+
+        if not isinstance(sample_result, tuple) or len(sample_result) != 2:
+            raise RuntimeError(
+                "PiBehavior.sample_actions() must return "
+                "(actions, subtask_logits). "
+                "Check src/b1k/models/pi_behavior.py"
+            )
+
+        actions, subtask_logits = sample_result
 
         model_time = time.monotonic() - start_time
 

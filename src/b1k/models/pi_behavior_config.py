@@ -32,10 +32,6 @@ import openpi.shared.nnx_utils as nnx_utils
 
 from b1k.models.observation import Observation
 
-# Repo note:
-# The publishing-facing `v1` experiment keeps the baseline structure and turns
-# on correlated noise through `pi_behavior_b1k_v1` in training/config.py.
-
 # TYPE_CHECKING: 순환 import를 피하기 위해 타입 힌트 전용으로만 import한다.
 # 실행 시점에는 이 블록이 실행되지 않으므로 실제 import 비용이 없다.
 if TYPE_CHECKING:

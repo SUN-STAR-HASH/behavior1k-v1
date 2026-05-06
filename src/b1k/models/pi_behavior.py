@@ -403,13 +403,13 @@ class PiBehavior(_model.BaseModel):
         # train() / eval() 호출로 자동 변경된다.
         self.deterministic = True  # 기본값은 추론 모드(dropout 등 비활성화)
 
-        # [4/9 추가] 디버그 trace 출력용 helper
-        # 환경변수 B1K_DEBUG_TRACE=1 일 때만 shape 로그를 찍어서
-        # 평소 실행에서는 로그가 너무 많아지지 않게 한다.
-        def _debug_trace(self, msg: str):
-            if os.environ.get("B1K_DEBUG_TRACE", "0") == "1":
-                logger.info(f"[TRACE] {msg}")
-        #####################
+    # [4/9 추가] 디버그 trace 출력용 helper
+    # 환경변수 B1K_DEBUG_TRACE=1 일 때만 shape 로그를 찍어서
+    # 평소 실행에서는 로그가 너무 많아지지 않게 한다.
+    def _debug_trace(self, msg: str):
+        if os.environ.get("B1K_DEBUG_TRACE", "0") == "1":
+            logger.info(f"[TRACE] {msg}")
+    #####################
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Stage 인코딩
@@ -1060,6 +1060,185 @@ class PiBehavior(_model.BaseModel):
 
         return tokens, input_mask, ar_mask, adarms_cond
 
+
+    # [수정일: 2026-04-29]
+    # [수정 이유]
+    # eval/websocket inference에서 rolling inpainting을 제대로 사용하기 위해
+    # initial_actions 인자를 PiBehavior.sample_actions()에서 직접 받도록 수정한다.
+    #
+    # 기존 문제:
+    # - PiBehavior.sample_actions()가 initial_actions를 받지 않음
+    # - policy 쪽에서 initial_actions를 pop으로 제거함
+    # - sample_actions()가 actions 하나만 반환해서 policy 쪽에서 subtask_logits를 더미 zero로 채움
+    #
+    # 수정 목표:
+    # - initial_actions를 유지해서 action chunk 간 연속성을 보존
+    # - sample_actions()가 (actions, subtask_logits)를 반환
+    # - policy 쪽 임시 패치를 제거할 수 있게 함
+    def _legacy_sample_actions_simple(
+        self,
+        rng: at.KeyArrayLike,
+        observation: Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        initial_actions: at.Float[at.Array, "b ah ad"] | None = None,
+    ):
+        # inference용 observation 전처리
+        observation = preprocess_observation(None, observation, train=False)
+
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        # 초기 noise 생성
+        if noise is None:
+            noise = jax.random.normal(
+                rng,
+                (batch_size, self.action_horizon, self.action_dim),
+                dtype=jnp.float32,
+            )
+        else:
+            noise = jnp.asarray(noise, dtype=jnp.float32)
+
+        # ---------------------------------------------------------------
+        # initial_actions 처리
+        # ---------------------------------------------------------------
+        # initial_actions는 이전 prediction에서 남겨둔 action chunk다.
+        # flow matching에서는 t 시점의 action이
+        # x_t = (1 - t) * clean_action + t * noise
+        # 형태이므로, inpainting으로 고정할 action도 timestep에 맞게 noising해서 넣어야 한다.
+        use_inpainting = initial_actions is not None
+
+        if use_inpainting:
+            initial_actions = jnp.asarray(initial_actions, dtype=jnp.float32)
+
+            if initial_actions.ndim == 2:
+                initial_actions = initial_actions[None, ...]
+
+            # action_horizon보다 길면 자르고, 짧으면 뒤쪽은 0으로 채운다.
+            keep_len = min(initial_actions.shape[1], self.action_horizon)
+
+            initial_full = jnp.zeros_like(noise)
+            initial_full = initial_full.at[:, :keep_len, :].set(
+                initial_actions[:, :keep_len, :]
+            )
+
+            inpaint_mask = jnp.zeros_like(noise, dtype=jnp.bool_)
+            inpaint_mask = inpaint_mask.at[:, :keep_len, :].set(True)
+        else:
+            initial_full = jnp.zeros_like(noise)
+            inpaint_mask = jnp.zeros_like(noise, dtype=jnp.bool_)
+
+        # ---------------------------------------------------------------
+        # 1) prefix forward 1회로 KV cache 생성
+        # ---------------------------------------------------------------
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+        (prefix_out, _), kv_cache_full = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=prefix_positions,
+        )
+
+        # stage/subtask logits 계산
+        # 기본 12-task baseline은 tokenized_prompt에 task id 하나만 들어오므로
+        # stage prompt가 없으면 zero logits를 반환한다.
+        has_stage_prompt = (
+            observation.tokenized_prompt is not None
+            and observation.tokenized_prompt.shape[1] > 1
+        )
+
+        if has_stage_prompt:
+            first_stage_token_idx = jnp.argmax(prefix_ar_mask)
+            base_task_token_idx = first_stage_token_idx - 1
+            base_task_output = prefix_out[:, base_task_token_idx, :]
+
+            subtask_logits = self.stage_pred_from_vlm(base_task_output)
+
+            task_ids = observation.tokenized_prompt[:, 0]
+            task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
+            task_num_stages = task_num_stages_array[task_ids]
+
+            stage_range = jnp.arange(MAX_NUM_STAGES)
+            valid_mask = stage_range[None, :] < task_num_stages[:, None]
+            subtask_logits = jnp.where(valid_mask, subtask_logits, -jnp.inf)
+        else:
+            subtask_logits = jnp.zeros(
+                (batch_size, MAX_NUM_STAGES),
+                dtype=prefix_out.dtype,
+            )
+
+        kv_cache = kv_cache_full
+        if self.kv_transform is not None:
+            kv_cache = self.kv_transform(kv_cache)
+
+        # ---------------------------------------------------------------
+        # 2) reverse ODE loop
+        # ---------------------------------------------------------------
+        def step(carry):
+            x_t, time = carry
+
+            # inpainting 영역은 현재 time에 맞게 noising된 initial action으로 고정
+            noised_initial = (1.0 - time) * initial_full + time * noise
+            x_t = jnp.where(inpaint_mask, noised_initial, x_t)
+
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+            )
+
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+
+            prefix_to_suffix_mask = einops.repeat(
+                prefix_mask,
+                "b p -> b s p",
+                s=suffix_tokens.shape[1],
+            )
+
+            full_attn_mask = jnp.concatenate(
+                [prefix_to_suffix_mask, suffix_attn_mask],
+                axis=-1,
+            )
+
+            suffix_positions = (
+                jnp.sum(prefix_mask, axis=-1)[:, None]
+                + jnp.cumsum(suffix_mask, axis=-1)
+                - 1
+            )
+
+            (prefix_out_suffix, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=suffix_positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+
+            assert prefix_out_suffix is None
+
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+
+            next_time = time + dt
+            x_next = x_t + dt * v_t
+
+            # 다음 timestep에서도 inpainting 영역 유지
+            noised_initial_next = (1.0 - next_time) * initial_full + next_time * noise
+            x_next = jnp.where(inpaint_mask, noised_initial_next, x_next)
+
+            return x_next, next_time
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+
+        # policy wrapper가 기대하는 형태로 반환
+        return x_0, subtask_logits
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 손실 함수
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1177,7 +1356,12 @@ class PiBehavior(_model.BaseModel):
         # ── 3. Stage prediction (보조 학습) ────────────────────────────────
         # stage conditioning 경로(tokenized_prompt.shape[1] > 1)에서만 실행된다.
         # 기본 12-task baseline에서는 이 분기가 실행되지 않는다.
-        if observation.tokenized_prompt.shape[1] > 1:
+        has_stage_prompt = (
+            observation.tokenized_prompt is not None
+            and observation.tokenized_prompt.shape[1] > 1
+        )
+
+        if has_stage_prompt:
             # prefix 시퀀스에서 base task 토큰의 출력을 찾는다.
             # first_stage_token_idx: stage 토큰 중 첫 번째(AR=True)의 위치
             # base_task_token_idx: 그 바로 앞이 base task 토큰
@@ -1284,6 +1468,8 @@ class PiBehavior(_model.BaseModel):
 
         subtask_loss_value = 0.0
         if train and observation.tokenized_prompt.shape[1] > 1:
+            # 정답 stage는 tokenized_prompt[:, 1]에 들어 있다.
+            # ComputeSubtaskStateFromMeta가 timestamp를 episode 진행률로 바꿔 만든 값이다.
             ground_truth_subtask = observation.tokenized_prompt[:, 1]
             subtask_loss = -jax.nn.log_softmax(subtask_logits, axis=-1)[
                 jnp.arange(ground_truth_subtask.shape[0]), ground_truth_subtask
@@ -1297,7 +1483,61 @@ class PiBehavior(_model.BaseModel):
             losses["subtask_loss"] = jnp.zeros((batch_size,), dtype=actions.dtype)
             losses["subtask_accuracy"] = jnp.zeros((batch_size,), dtype=actions.dtype)
 
-        losses["total_loss"] = losses["action_loss"] + subtask_loss_value
+
+        # [2026-04-17] train.py는 losses_dict["total_loss"]를 기대하므로
+        # compute_detailed_loss()에서 최종 loss를 명시적으로 만들어 준다.
+
+        # [2026-04-18 수정]
+        # flow loss는 경우에 따라 [B, H] 또는 [B]로 들어올 수 있다.
+        # 그런데 아래 보조 loss(subtask, fast)는 최종적으로 [B, 1] 형태로 더하고 있어서,
+        # flow가 [B]인 상태로 바로 더하면 broadcasting이 의도와 다르게 꼬일 수 있다.
+        # 그래서 total_loss를 먼저 최소 [B, 1] 형태로 맞춘 뒤 aux loss를 더하도록 수정한다.
+
+        total_loss = losses["flow"]
+
+        # flow loss가 [B]이면 [B, 1]로 바꿔서
+        # subtask/fast loss([B, 1])와 안전하게 더할 수 있게 맞춘다.
+        if total_loss.ndim == 1:
+            total_loss = total_loss[:, None]
+
+        if self.config.subtask_loss_weight > 0 and "subtask_loss" in losses:
+            subtask_loss = losses["subtask_loss"]
+
+            # subtask loss가 [B, ...] 형태면
+            # 배치축(B)을 제외한 나머지 축을 평균내서 [B]로 정리한다.
+            if subtask_loss.ndim > 1:
+                subtask_loss = jnp.mean(
+                    subtask_loss,
+                    axis=tuple(range(1, subtask_loss.ndim)),
+                )
+
+            # [B] -> [B, 1]
+            # flow loss의 horizon 축 전체에 같은 subtask penalty를 더하기 위한 형태
+            subtask_loss = subtask_loss[:, None]
+
+            total_loss = total_loss + self.config.subtask_loss_weight * subtask_loss
+
+        if self.config.fast_loss_weight > 0 and "fast" in losses:
+            fast_loss = losses["fast"]
+
+            # fast loss도 [B, ...] 형태일 수 있으므로
+            # 배치축만 남기고 평균내서 [B]로 정리한다.
+            if fast_loss.ndim > 1:
+                fast_loss = jnp.mean(
+                    fast_loss,
+                    axis=tuple(range(1, fast_loss.ndim)),
+                )
+
+            # [B] -> [B, 1]
+            # flow loss와 shape을 맞춰 안전하게 더한다.
+            fast_loss = fast_loss[:, None]
+
+            total_loss = total_loss + self.config.fast_loss_weight * fast_loss
+
+        # 최종 total_loss shape:
+        # - 원래 flow가 [B, H]였다면 [B, H]
+        # - 원래 flow가 [B]였다면 [B, 1]
+        losses["total_loss"] = total_loss
 
         return losses
 
@@ -1311,7 +1551,12 @@ class PiBehavior(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         initial_actions: at.Float[at.Array, "b n ad"] | None = None,
     ) -> tuple[_model.Actions, at.Float[at.Array, "b s"]]:
-        """Flow matching ODE를 적분해서 action chunk와 stage logits를 반환한다."""
+        """Flow matching ODE를 적분해서 action chunk와 stage logits를 반환한다.
+
+        Stage tracking을 쓰려면 추론 입력의 tokenized_prompt가
+        [local_task_id, current_stage] 형태여야 한다. wrapper가 current_stage를 넣고,
+        여기서 모델이 다음 stage 분포를 예측해 wrapper가 voting으로 갱신한다.
+        """
         observation = preprocess_observation(None, observation, train=False)
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
@@ -1322,6 +1567,7 @@ class PiBehavior(_model.BaseModel):
                 "FAST tokens are only used during auxiliary training."
             )
 
+        # ── 초기 noise 생성 / rolling inpainting 준비 ─────────────────────
         if initial_actions is not None:
             num_initial_actions = initial_actions.shape[1]
             input_action_dim = initial_actions.shape[2]
@@ -1390,6 +1636,7 @@ class PiBehavior(_model.BaseModel):
 
         rng, step_rng = jax.random.split(rng)
 
+        # ── Prefix 한 번 계산: image/task/stage/state KV cache 생성 ───────
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
@@ -1399,6 +1646,7 @@ class PiBehavior(_model.BaseModel):
             positions=positions,
         )
 
+        # Stage logit은 base task token의 VLM 출력에서 예측한다.
         if observation.tokenized_prompt.shape[1] > 1:
             first_stage_token_idx = jnp.argmax(prefix_ar_mask)
             base_task_token_idx = first_stage_token_idx - 1
@@ -1437,13 +1685,14 @@ class PiBehavior(_model.BaseModel):
                 + jnp.cumsum(suffix_mask, axis=-1) - 1
             )
 
-            (_, suffix_out), _ = self.PaliGemma.llm(
+            (prefix_out_suffix, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
                 positions=positions,
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
+            del prefix_out_suffix
 
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
             x_t_new = x_t + dt * v_t
